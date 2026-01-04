@@ -1,0 +1,735 @@
+from system.pyj.minescript import *
+
+ClickType = JavaClass("net.minecraft.world.inventory.ClickType")
+TagParser  = JavaClass("net.minecraft.nbt.TagParser")
+Minecraft  = JavaClass("net.minecraft.client.Minecraft")
+
+# Java HTTP
+URL = JavaClass("java.net.URL")
+BufferedReader = JavaClass("java.io.BufferedReader")
+InputStreamReader = JavaClass("java.io.InputStreamReader")
+StringBuilder = JavaClass("java.lang.StringBuilder")
+Thread = JavaClass("java.lang.Thread")
+OutputStreamWriter = JavaClass("java.io.OutputStreamWriter")
+UUID = JavaClass("java.util.UUID")
+HitResult = JavaClass("net.minecraft.world.phys.HitResult")
+BlockHitResult = JavaClass("net.minecraft.world.phys.BlockHitResult")
+EntityHitResult = JavaClass("net.minecraft.world.phys.EntityHitResult")
+InteractionHand = JavaClass("net.minecraft.world.InteractionHand")
+
+
+TRADE_MARKET_NAME = "\udaff\udfe8\ue011"
+
+BACKEND_END_URL = "https://api.wynntrade.site"  # we'll append {sweep_id}/end
+BACKEND_INGEST_URL = BACKEND_END_URL + "/api/ingest_page"
+BACKEND_END_SWEEP_URL = BACKEND_END_URL + "/api/sweeps/"
+REQUEST_TIMEOUT_MS = 5000
+PAGE_PARSE_DELAY_MS = 800
+
+# globals
+sweep_id = None
+page_index = 1
+bot_instance = player().name
+
+# bot control globals
+bot_paused = False
+last_seen_action_version = -1
+last_acked_version = -1
+
+# tick pacing (20 ticks ~ 1s)
+HEARTBEAT_EVERY_TICKS = 20 * 2   # 10s
+ACTION_POLL_EVERY_TICKS = 20 * 2  # 2s
+
+_hb_tick = 0
+_act_tick = 0
+
+
+# -----------------------
+# Minimal JSON builder
+# -----------------------
+def json_escape(s):
+    # escape for JSON string (no imports)
+    out = ""
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\":
+            out += "\\\\"
+        elif c == '"':
+            out += '\\"'
+        elif c == "\n":
+            out += "\\n"
+        elif c == "\r":
+            out += "\\r"
+        elif c == "\t":
+            out += "\\t"
+        else:
+            o = ord(c)
+            if o < 32:
+                # \u00XX
+                hx = hex(o)[2:]
+                while len(hx) < 4:
+                    hx = "0" + hx
+                out += "\\u" + hx
+            else:
+                out += c
+        i += 1
+    return out
+
+
+def explain_java_exc(e):
+    # unwrap InvocationTargetException / RuntimeException chains
+    try:
+        parts = [str(e)]
+        cur = e
+        # many Java exceptions expose getCause()
+        while hasattr(cur, "getCause") and cur.getCause() is not None:
+            cur = cur.getCause()
+            parts.append(str(cur))
+        return " <- ".join(parts)
+    except Exception:
+        return str(e)
+
+def build_end_sweep_json(pages_scraped_int, items_per_page_int, reason_str):
+    s = "{"
+    s += '"pages_scraped":' + str(pages_scraped_int) + ","
+    s += '"items_per_page":' + str(items_per_page_int) + ","
+    s += '"reason":"' + json_escape(reason_str) + '"'
+    s += "}"
+    return s
+
+def send_end_sweep_to_backend(reason="completed"):
+    global sweep_id, page_index
+
+    if sweep_id is None:
+        return
+
+    # Your UI listing slots are 0..44 -> 45 items per page
+    items_per_page = 45
+
+    # page_index is the last page number processed
+    pages_scraped = int(page_index)
+
+    url = BACKEND_END_SWEEP_URL + str(sweep_id) + "/end"
+    body = build_end_sweep_json(pages_scraped, items_per_page, reason)
+
+    def task():
+        try:
+            echo("END url:", url)
+            echo("END body:", body)
+            code, resp = http_post_json(url, body, REQUEST_TIMEOUT_MS)
+            set_timeout(lambda: echo("END sweep", str(sweep_id), "->", code), 0)
+            if code >= 400:
+                set_timeout(lambda: echo("END resp:", resp), 0)
+        except Exception as e:
+            # try to print Java stacktrace if available
+            try:
+                e.printStackTrace()
+            except Exception:
+                pass
+            set_timeout(lambda: echo("HTTP error (end sweep):", explain_java_exc(e)), 0)
+
+    Thread(task).start()
+
+
+
+
+
+
+
+
+def build_ingest_json(sweep_id_str, page_index_int, bot_instance_str, items):
+    # items: list of dicts with keys item_name, amount, price
+    s = "{"
+    s += '"sweep_id":"' + json_escape(sweep_id_str) + '",'
+    s += '"page_index":' + str(page_index_int) + ","
+    s += '"current_page":' + str(page_index_int) + ","
+    s += '"bot_instance":"' + json_escape(bot_instance_str) + '",'
+    s += '"items":['
+
+    first = True
+    for it in items:
+        if not first:
+            s += ","
+        first = False
+        s += "{"
+        s += '"item_name":"' + json_escape(it["item_name"]) + '",'
+        s += '"amount":"' + json_escape(it["amount"]) + '",'
+        s += '"price":"' + json_escape(it["price"]) + '"'
+        s += "}"
+    s += "]}"
+    return s
+
+
+# -----------------------
+# String parsing helpers (no regex)
+# -----------------------
+def strip_mc_format(s):
+    # removes § + next char
+    out = ""
+    i = 0
+    while i < len(s):
+        if s[i] == "§" and i + 1 < len(s):
+            i += 2
+            continue
+        out += s[i]
+        i += 1
+    return out
+
+
+def first_number(s):
+    # returns first number as string (digits + optional dot), ignoring commas
+    t = strip_mc_format(s)
+    i = 0
+    # find first digit
+    while i < len(t) and t[i] not in "0123456879":
+        i += 1
+    if i >= len(t):
+        return None
+
+    out = ""
+    dot_seen = False
+    while i < len(t):
+        c = t[i]
+        if c in "0123456879":
+            out += c
+        elif c == ",":
+            # ignore thousands separator
+            pass
+        elif c == "." and not dot_seen:
+            dot_seen = True
+            out += "."
+        else:
+            break
+        i += 1
+
+    if out == "":
+        return None
+    return out
+
+
+def parse_amount_price(price_text):
+    # tries "amount x price" then fallback to just price
+    t = strip_mc_format(price_text)
+
+    return None
+
+
+# -----------------------
+# Your NBT parsing
+# -----------------------
+def get_custom_name(nbt):
+    comps = nbt.getCompoundOrEmpty("components")
+    name_tag = comps.getCompoundOrEmpty("minecraft:custom_name")
+    name = name_tag.getStringOr("text", "")
+    if not name:
+        try:
+            name = str(name_tag.get("extra")[-1]).replace('"', "").lstrip()
+        except Exception:
+            pass
+    return name
+
+    
+    
+
+
+def get_amount_and_price(nbt):
+    # Scan lore: find line containing "price", read next line for numbers
+    comps = nbt.getCompoundOrEmpty("components")
+    lore = comps.get("minecraft:lore")
+    if not lore:
+        return None
+    idx = 0
+    
+    amount_str = "0"
+    unit_price = "0²"
+    
+    while idx < len(lore):
+        item = lore[idx]
+        extra = item.get("extra")
+        if extra:
+            v = str(extra[len(extra) - 1])
+    #         # crude "contains price" check without regex
+            if "price" in strip_mc_format(v).lower():
+                if idx + 1 >= len(lore):
+                    return None
+                price_item = lore[idx + 1]
+                price_extra = price_item.get("extra")
+                if not price_extra:
+                    return None
+                price_text = str(price_extra[-1].get("text")).replace('"', "")
+                
+                if "§7x" in price_text:
+                    amount_str, rest = price_text.split("§7x")
+                    amount_str = str(strip_mc_format(amount_str.strip())).replace(",", "")
+                    rest = strip_mc_format(rest).strip()
+                    
+                    unit_price = rest.split(" (")[0].replace("²", "").replace(",", "")
+                    # return amount_str, unit_price
+                else:
+                    amount_str = "1"
+                    rest = strip_mc_format(price_text).strip()
+                    
+                    unit_price = rest.split(" (")[0].replace("²", "").replace(",", "")
+        idx += 1
+
+    return amount_str, unit_price
+
+
+# -----------------------
+# HTTP POST (no json lib)
+# -----------------------
+def http_post_json(url, body_str, timeout_ms):
+    conn = URL(url).openConnection()
+    conn.setConnectTimeout(timeout_ms)
+    conn.setReadTimeout(timeout_ms)
+    conn.setRequestMethod("POST")
+    conn.setDoOutput(True)
+    conn.setRequestProperty("Content-Type", "application/json")
+    conn.setRequestProperty("Accept", "application/json")
+    conn.setRequestProperty("User-Agent", "Minescript/Pyjinn")
+
+    writer = OutputStreamWriter(conn.getOutputStream(), "UTF-8")
+    writer.write(body_str)
+    writer.flush()
+    writer.close()
+
+    code = conn.getResponseCode()
+    stream = conn.getInputStream() if code < 400 else conn.getErrorStream()
+    if stream is None:
+        conn.disconnect()
+        return code, ""
+
+    reader = BufferedReader(InputStreamReader(stream))
+    sb = StringBuilder()
+    line = reader.readLine()
+    while line is not None:
+        sb.append(line)
+        sb.append("\n")
+        line = reader.readLine()
+    reader.close()
+    conn.disconnect()
+    return code, sb.toString()
+
+
+def send_page_to_backend(items_payload):
+    global sweep_id, page_index, bot_instance
+
+    body = build_ingest_json(str(sweep_id), int(page_index), bot_instance, items_payload)
+    def task():
+        try:
+            code, resp = http_post_json(BACKEND_INGEST_URL, body, REQUEST_TIMEOUT_MS)
+            set_timeout(lambda: echo("POST page", page_index, "->", code), 0)
+            if code >= 400:
+                set_timeout(lambda: echo("Body:", resp), 0)
+        except Exception as e:
+            set_timeout(lambda: echo("HTTP error:", str(e)), 0)
+
+    Thread(task).start()
+
+def http_get(url, timeout_ms):
+    conn = URL(url).openConnection()
+    conn.setConnectTimeout(timeout_ms)
+    conn.setReadTimeout(timeout_ms)
+    conn.setRequestMethod("GET")
+    conn.setRequestProperty("Accept", "application/json")
+    conn.setRequestProperty("User-Agent", "Minescript/Pyjinn")
+
+    code = conn.getResponseCode()
+    stream = conn.getInputStream() if code < 400 else conn.getErrorStream()
+    if stream is None:
+        conn.disconnect()
+        return code, ""
+
+    reader = BufferedReader(InputStreamReader(stream))
+    sb = StringBuilder()
+    line = reader.readLine()
+    while line is not None:
+        sb.append(line)
+        sb.append("\n")
+        line = reader.readLine()
+    reader.close()
+    conn.disconnect()
+    return code, sb.toString()
+
+
+def _json_find_string(resp, key):
+    # naive: finds "key":"VALUE"
+    pat = '"' + key + '":"'
+    i = resp.find(pat)
+    if i < 0:
+        return None
+    i += len(pat)
+    j = resp.find('"', i)
+    if j < 0:
+        return None
+    return resp[i:j]
+
+
+def _json_find_int(resp, key):
+    # naive: finds "key":123
+    pat = '"' + key + '":'
+    i = resp.find(pat)
+    if i < 0:
+        return None
+    i += len(pat)
+    # skip spaces
+    while i < len(resp) and (resp[i] == " " or resp[i] == "\n" or resp[i] == "\r" or resp[i] == "\t"):
+        i += 1
+    j = i
+    if j < len(resp) and resp[j] == "-":
+        j += 1
+    while j < len(resp) and resp[j] in "0123456879":
+        j += 1
+    if j == i:
+        return None
+    try:
+        return int(resp[i:j])
+    except Exception:
+        return None
+
+
+def _json_find_bool(resp, key):
+    pat = '"' + key + '":'
+    i = resp.find(pat)
+    if i < 0:
+        return None
+    i += len(pat)
+    while i < len(resp) and resp[i] in [" ", "\n", "\r", "\t"]:
+        i += 1
+    if resp.startswith("true", i):
+        return True
+    if resp.startswith("false", i):
+        return False
+    return None
+
+
+
+
+def bot_close_gui():
+    try:
+        client = Minecraft.getInstance()
+        client.setScreen(None)
+    except Exception:
+        pass
+
+
+def bot_open_gui():
+    # Re-open: on réutilise ton interaction "use"
+    # (si sur Wynncraft le GUI est lié à un NPC, ça fait le job)
+    try:
+        player_press_use(True)
+        set_timeout(lambda: player_press_use(False), 1000)
+    except Exception:
+        pass
+
+
+def build_ack_json(action_version_int):
+    return '{"action_version":' + str(int(action_version_int)) + "}"
+
+
+def send_bot_ack(action_version_int):
+    global bot_instance
+    url = BACKEND_END_URL + "/api/bots/" + json_escape(bot_instance) + "/ack"
+    body = build_ack_json(action_version_int)
+
+    def task():
+        try:
+            code, resp = http_post_json(url, body, REQUEST_TIMEOUT_MS)
+            if code >= 400:
+                set_timeout(lambda: echo("ACK error", code, resp), 0)
+        except Exception as e:
+            set_timeout(lambda: echo("ACK http error:", explain_java_exc(e)), 0)
+
+    Thread(task).start()
+
+
+def send_bot_heartbeat():
+    # Si tu as créé /api/bots/{bot}/heartbeat, on l'utilise.
+    # Sinon, fallback: GET /action (ça fait déjà heartbeat dans le back que je t'ai proposé).
+    global bot_instance
+    hb_url = BACKEND_END_URL + "/api/bots/" + json_escape(bot_instance) + "/heartbeat"
+    fallback_url = BACKEND_END_URL + "/api/bots/" + json_escape(bot_instance) + "/action"
+
+    def task():
+        try:
+            # try POST heartbeat
+            code, resp = http_post_json(hb_url, "{}", REQUEST_TIMEOUT_MS)
+            if code == 404:
+                # fallback GET action (heartbeat implicite)
+                code2, _ = http_get(fallback_url, REQUEST_TIMEOUT_MS)
+                if code2 >= 400:
+                    set_timeout(lambda: echo("HB fallback error", code2), 0)
+            elif code >= 400:
+                set_timeout(lambda: echo("HB error", code, resp), 0)
+        except Exception as e:
+            set_timeout(lambda: echo("HB http error:", explain_java_exc(e)), 0)
+
+    Thread(task).start()
+
+restarted = False
+
+def poll_bot_action():
+    global bot_instance, bot_paused, last_seen_action_version, last_acked_version
+
+    url = BACKEND_END_URL + "/api/bots/" + json_escape(bot_instance) + "/action"
+
+    def task():
+        global bot_paused, last_seen_action_version, last_acked_version, restarted
+        
+        try:
+            code, resp = http_get(url, REQUEST_TIMEOUT_MS)
+            if code >= 400:
+                set_timeout(lambda: echo("ACTION poll error", code, resp), 0)
+                return
+
+            desired = _json_find_string(resp, "desired_action")
+            av = _json_find_int(resp, "action_version")
+            lav = _json_find_int(resp, "last_ack_version")
+            pending = _json_find_bool(resp, "pending")
+            
+            
+
+            if desired is None or av is None:
+                return
+
+            # garder trace ack côté client (debug)
+            if lav is not None:
+                last_acked_version = int(lav)
+
+            # On ne traite que si pending ou nouvelle version
+            if pending is not None and pending is False and av <= last_seen_action_version:
+                return
+
+            if av <= last_seen_action_version:
+                return
+
+            # Marque version vue (anti double-exec)
+            last_seen_action_version = int(av)
+
+            def apply_action():
+                global bot_paused, page_index, listener_id
+                # RUN: on reprend (ne rien faire côté GUI, mais sortir de pause)
+                if desired == "RUN":
+                    restarted = False
+                    bot_paused = False
+                    # pas de manipulation GUI demandée
+                    echo("[BOT ACTION] RUN -> resume")
+                    send_bot_ack(av)
+                    return
+
+                # STOP: fermer GUI + passer en pause
+                if desired == "STOP":
+                    echo("[BOT ACTION] STOP -> close GUI and pause")
+                    bot_paused = True
+                    bot_close_gui()
+                    send_bot_ack(av)
+                    return
+
+                # RESTART: fermer + rouvrir GUI
+                if desired == "RESTART":
+                    if restarted:
+                        return
+                    restarted = True
+                    echo("[BOT ACTION] RESTART -> reopen GUI")
+                    bot_paused = True
+                    bot_close_gui()
+                    page_index = 1
+                    set_timeout(bot_open_gui, 20)
+                    
+                    def restart_loop():
+                        global bot_paused, listener_id
+                        bot_paused = False
+                        listener_id = add_event_listener("tick", main)
+                        
+                    
+                    set_timeout(restart_loop, PAGE_PARSE_DELAY_MS + 20)
+                    
+                    
+                    send_bot_ack(av)
+                    return
+
+                # action inconnue: ignore
+                echo("[BOT ACTION] unknown:", desired)
+
+            set_timeout(apply_action, 0)
+
+        except Exception as e:
+            set_timeout(lambda: echo("ACTION http error:", explain_java_exc(e)), 0)
+
+    Thread(task).start()
+
+
+
+
+# -----------------------
+# Pagination + parsing
+# -----------------------
+def get_stack_in_slot(slot_index):
+    client = Minecraft.getInstance()
+    player = client.player
+    if not player:
+        return None
+
+    menu = player.containerMenu
+    slots = menu.slots
+
+    if slot_index < 0 or slot_index >= slots.size():
+        return None
+
+    slot = slots.get(slot_index)
+    if not slot.hasItem():
+        return None
+
+    stack = slot.getItem()
+    if stack.isEmpty():
+        return None
+
+    return stack
+
+
+def next_page_click():
+    client = Minecraft.getInstance()
+    player = client.player
+    if not player:
+        return False
+
+    menu = player.containerMenu
+    container_id = menu.containerId
+
+    slot_id = 53
+    button = 0
+
+    if get_stack_in_slot(slot_id):
+        client.gameMode.handleInventoryMouseClick(container_id, slot_id, button, ClickType.PICKUP, player)
+        return True
+    return False
+
+
+def parse_and_send_current_page():
+    global page_index
+    
+    if bot_paused:
+        return
+    inv = container_get_items()
+    
+    
+
+    # slots 0..44 are listings
+    listing_items = []
+    i = 0
+    while i < len(inv):
+        it = inv[i]
+        if it.slot is not None and it.slot >= 0 and it.slot < 45:
+            listing_items.append(it)
+        i += 1
+
+    # sort by slot index (simple bubble-ish since list is small)
+    # (no imports; keep it simple)
+    n = len(listing_items)
+    a = 0
+    while a < n:
+        b = a + 1
+        while b < n:
+            if listing_items[b].slot < listing_items[a].slot:
+                tmp = listing_items[a]
+                listing_items[a] = listing_items[b]
+                listing_items[b] = tmp
+            b += 1
+        a += 1
+
+    items_payload = []
+    j = 0
+    while j < len(listing_items):
+        it = listing_items[j]
+        try:
+            nbt = TagParser.parseCompoundFully(it.nbt)
+            name = get_custom_name(nbt)
+            ap = get_amount_and_price(nbt)
+            
+            
+            if ap:
+                amount_str, price_str = ap
+                if price_str:
+                    items_payload.append({
+                        "item_name": name,
+                        "amount": str(amount_str),
+                        "price": str(price_str),
+                    })
+        except Exception:
+            pass
+        j += 1
+
+    send_page_to_backend(items_payload)
+    
+    try:
+        if next_page_click():
+            page_index += 1
+            set_timeout(parse_and_send_current_page, PAGE_PARSE_DELAY_MS)
+        else:
+            print('ouiuoiuiouoiuoiuoiuoiu')
+            client = Minecraft.getInstance()
+            client.setScreen(None)
+            
+            echo("Finished sweep. Last page_index =", page_index)
+            
+            send_end_sweep_to_backend("completed")
+            
+            cached = client.hitResult
+            
+            set_timeout(lambda _: player_press_use(True),player_press_use(False), 20)
+            global listener_id
+            listener_id = add_event_listener("tick", main)
+            
+            # later: call /sweep/end if you add it
+    except:
+        pass
+
+
+# -----------------------
+# Start sweep when market opens
+# -----------------------
+def main(event):
+    global sweep_id, page_index, bot_instance
+
+    screen = screen_name()
+    if screen != TRADE_MARKET_NAME:
+        return
+
+    
+    
+    client = Minecraft.getInstance()
+    player = client.player
+    if player:
+        try:
+            bot_instance = str(player.getName().getString())
+        except Exception:
+            bot_instance = "bot-1"
+
+    sweep_id = UUID.randomUUID()
+    page_index = 1
+
+    echo("Starting sweep:", str(sweep_id), "bot:", bot_instance)
+
+    set_timeout(parse_and_send_current_page, PAGE_PARSE_DELAY_MS)
+    remove_event_listener(listener_id)
+
+def heartbeat_tick(event):
+    global _hb_tick
+    _hb_tick += 1
+    if _hb_tick >= HEARTBEAT_EVERY_TICKS:
+        _hb_tick = 0
+        send_bot_heartbeat()
+
+
+def action_tick(event):
+    global _act_tick
+    _act_tick += 1
+    if _act_tick >= ACTION_POLL_EVERY_TICKS:
+        _act_tick = 0
+        poll_bot_action()
+
+listener_id = add_event_listener("tick", main)
+hb_listener_id = add_event_listener("tick", heartbeat_tick)
+act_listener_id = add_event_listener("tick", action_tick)
+
